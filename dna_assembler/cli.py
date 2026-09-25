@@ -5,7 +5,8 @@
     python -m dna_assembler < input.json
     python -m dna_assembler input.json
 
-正常结果打印到 stdout；输入问题以 JSON 形式打印到 stderr，退出码 2。
+正常结果打印到 stdout；双 contig 无合法二分时 stdout 输出
+``NO_TWO_CONTIGS``；输入问题以 JSON 形式打印到 stderr，退出码 2。
 """
 
 from __future__ import annotations
@@ -13,7 +14,13 @@ from __future__ import annotations
 import json
 import sys
 
-from .assembler import AssemblyError, assemble, parse_payload
+from .assembler import (
+    NO_TWO_CONTIGS,
+    AssemblyError,
+    assemble,
+    parse_payload,
+    requested_contig_count,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -36,7 +43,8 @@ def main(argv: list[str] | None = None) -> int:
         except json.JSONDecodeError as exc:
             raise AssemblyError(f"JSON 解析失败: {exc}", "invalid_json") from exc
         reads = parse_payload(payload)
-        result = assemble(reads)
+        contig_count = requested_contig_count(payload)
+        result = assemble(reads, contigs=contig_count)
     except AssemblyError as exc:
         print(
             json.dumps({"error": exc.message, "code": exc.code}, ensure_ascii=False),
@@ -50,6 +58,11 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+
+    if result == NO_TWO_CONTIGS:
+        sys.stdout.write(NO_TWO_CONTIGS)
+        sys.stdout.write("\n")
+        return 0
 
     json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
     sys.stdout.write("\n")

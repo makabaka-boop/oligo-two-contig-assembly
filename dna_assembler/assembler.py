@@ -4,8 +4,12 @@
 --------
 * 每条读段恰选择正向或反向互补一次，寻找使最终串最短的排列与方向组合。
 * 相邻两条只按"前一条后缀 == 后一条前缀"的最大精确重叠连接。
-* 平局裁决：先取装配串字典序最小；装配串仍相同（如回文读段）时，再按
+* 单串平局裁决：先取装配串字典序最小；装配串仍相同（如回文读段）时，再按
   ``[(id, 方向), ...]`` 路径字典序最小。
+* 双 contig 模式要求每个非空 contig 内部的相邻读段至少有 1 个碱基重叠；
+  两条 contig 之间不拼接、不要求重叠。
+* 双 contig 并列时，分别用 ``(装配串, 路径)`` 将两条 contig 规范排序后，再
+  比较这一对结果。
 * 方向标记：``"+"`` 正向，``"-"`` 反向互补。
 
 算法：带子集的动态规划（Held-Karp 式）。10 条读段时
@@ -16,9 +20,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 _COMPLEMENT = str.maketrans("ACGT", "TGCA")
 _BASES = frozenset("ACGT")
+
+NO_TWO_CONTIGS = "NO_TWO_CONTIGS"
 
 
 class AssemblyError(ValueError):
@@ -60,7 +67,10 @@ def max_overlap(left: str, right: str) -> int:
 def parse_payload(payload: object) -> list[Read]:
     """校验 JSON 载荷并返回读段列表（保持上传次序）。"""
 
-    if not isinstance(payload, dict) or "reads" not in payload:
+    if not isinstance(payload, dict):
+        raise AssemblyError("载荷必须是 JSON 对象", "bad_payload")
+
+    if "reads" not in payload:
         raise AssemblyError("载荷必须是包含 reads 字段的 JSON 对象", "bad_payload")
     raw_reads = payload["reads"]
     if not isinstance(raw_reads, list):
@@ -94,6 +104,38 @@ def parse_payload(payload: object) -> list[Read]:
     return reads
 
 
+def requested_contig_count(payload: object) -> Literal[1, 2]:
+    """从请求载荷读取装配模式。
+
+    支持两种等价写法：``{"contigs": 2}`` 或
+    ``{"mode": "two_contigs"}``；省略时为原单串模式。
+    """
+
+    if not isinstance(payload, dict):
+        raise AssemblyError("载荷必须是 JSON 对象", "bad_payload")
+
+    mode = payload.get("mode", "single")
+    if mode not in ("single", "two_contigs"):
+        raise AssemblyError(
+            "mode 只能是 'single' 或 'two_contigs'", "bad_mode"
+        )
+    mode_count: Literal[1, 2] = 2 if mode == "two_contigs" else 1
+
+    if "contigs" not in payload:
+        return mode_count
+
+    count = payload["contigs"]
+    if (
+        isinstance(count, bool)
+        or not isinstance(count, int)
+        or count not in (1, 2)
+    ):
+        raise AssemblyError("contigs 只能为 1 或 2", "bad_contig_count")
+    if "mode" in payload and count != mode_count:
+        raise AssemblyError("mode 与 contigs 指定的装配模式不一致", "bad_mode")
+    return 1 if count == 1 else 2
+
+
 def _reject_containment_or_complement(reads: list[Read]) -> None:
     """拒绝反向互补对，以及任一方向上的完整包含。"""
 
@@ -117,23 +159,26 @@ def _reject_containment_or_complement(reads: list[Read]) -> None:
                 )
 
 
-def assemble(reads: list[Read]) -> dict:
-    """求最短装配，返回装配串与每条读段的方向、起止位置。
+def _subset_dp(
+    reads: list[Read], *, require_positive_overlap: bool
+) -> tuple[
+    list[tuple[str, str]],
+    dict[tuple[int, int, int, int], int],
+    dict[tuple[int, int, int], tuple[int, str, tuple[tuple[str, str], ...]]],
+    dict[int, tuple[int, str, tuple[tuple[str, str], ...]]],
+]:
+    """运行子集 DP。
 
-    位置采用 0 基、左闭右开区间（Python 切片语义），即
-    ``assembly[start:end]`` 恰为该读段所选方向上的序列。
+    ``require_positive_overlap=True`` 时，只允许至少一个碱基的相邻重叠；
+    单读段状态不受此限制，因此可作为只含一条读段的 contig。
     """
 
     n = len(reads)
-    if n == 0:
-        raise AssemblyError("没有读段可供装配")
-
     variants = [(r.seq, reverse_complement(r.seq)) for r in reads]
 
     # ov[(i, oi, j, oj)] = 读段 i 取方向 oi 时的后缀与读段 j 取方向 oj
-    # 时的前缀的最大精确重叠；tail 为随之需要追加到当前串末尾的片段。
+    # 时的前缀的最大精确重叠。
     ov: dict[tuple[int, int, int, int], int] = {}
-    tail: dict[tuple[int, int, int, int], str] = {}
     for i in range(n):
         for oi in range(2):
             left = variants[i][oi]
@@ -141,11 +186,7 @@ def assemble(reads: list[Read]) -> dict:
                 if i == j:
                     continue
                 for oj in range(2):
-                    nxt_seq = variants[j][oj]
-                    size = max_overlap(left, nxt_seq)
-                    edge = (i, oi, j, oj)
-                    ov[edge] = size
-                    tail[edge] = nxt_seq[size:]
+                    ov[(i, oi, j, oj)] = max_overlap(left, variants[j][oj])
 
     # dp[(mask, last, ori)] -> 最优部分状态：
     #   长度更小者优；长度相同装配串字典序更小者优；再相同路径字典序更小者优。
@@ -160,7 +201,6 @@ def assemble(reads: list[Read]) -> dict:
                 ((reads[i].id, "+" if ori == 0 else "-"),),
             )
 
-    full_mask = (1 << n) - 1
     for mask in range(1 << n):
         for last in range(n):
             for ori in range(2):
@@ -171,33 +211,41 @@ def assemble(reads: list[Read]) -> dict:
                 for nxt in range(n):
                     if mask & (1 << nxt):
                         continue
-                    new_mask = mask | (1 << nxt)
                     for nori in range(2):
                         edge = (last, ori, nxt, nori)
-                        shift = len(variants[nxt][nori]) - ov[edge]
+                        overlap = ov[edge]
+                        if require_positive_overlap and overlap == 0:
+                            continue
+                        nxt_seq = variants[nxt][nori]
                         candidate: State = (
-                            length + shift,
-                            text + tail[edge],
+                            length + len(nxt_seq) - overlap,
+                            text + nxt_seq[overlap:],
                             path
                             + ((reads[nxt].id, "+" if nori == 0 else "-"),),
                         )
-                        key = (new_mask, nxt, nori)
+                        key = (mask | (1 << nxt), nxt, nori)
                         current = dp.get(key)
                         if current is None or candidate < current:
                             dp[key] = candidate
 
-    best: State | None = None
-    for last in range(n):
-        for ori in range(2):
-            state = dp.get((full_mask, last, ori))
-            if state is not None and (best is None or state < best):
-                best = state
-    assert best is not None
-    length, assembly, path = best
+    best_by_mask: dict[int, State] = {}
+    for (mask, _last, _ori), state in dp.items():
+        current = best_by_mask.get(mask)
+        if current is None or state < current:
+            best_by_mask[mask] = state
 
-    # 由路径重放每条读段在装配串上的起止位置。
+    return variants, ov, dp, best_by_mask
+
+
+def _build_layout(
+    reads: list[Read],
+    variants: list[tuple[str, str]],
+    overlaps: dict[tuple[int, int, int, int], int],
+    path: tuple[tuple[str, str], ...],
+) -> list[dict]:
+    """由路径重放每条读段在所属 contig 上的局部起止位置。"""
+
     index_by_id = {r.id: idx for idx, r in enumerate(reads)}
-    orientation_by_id = {rid: sign for rid, sign in path}
     layout: list[dict] = []
     cursor = 0
     prev_idx: int | None = None
@@ -208,7 +256,7 @@ def assemble(reads: list[Read]) -> dict:
         if prev_idx is None:
             start = 0
         else:
-            start = cursor - ov[(prev_idx, prev_ori, idx, ori)]
+            start = cursor - overlaps[(prev_idx, prev_ori, idx, ori)]
         end = start + len(variants[idx][ori])
         cursor = end
         layout.append(
@@ -220,6 +268,59 @@ def assemble(reads: list[Read]) -> dict:
             }
         )
         prev_idx, prev_ori = idx, ori
+    return layout
+
+
+def assemble(
+    reads: list[Read],
+    contigs: int = 1,
+    *,
+    mode: str | None = None,
+) -> dict | Literal["NO_TWO_CONTIGS"]:
+    """按请求的 contig 数量装配。
+
+    可用 ``contigs=2`` 或 ``mode="two_contigs"`` 请求双 contig；两者都省略时，
+    默认为保持向后兼容的单串模式。``contigs`` 也可作为第二个位置参数传入。
+    """
+
+    if isinstance(contigs, bool) or contigs not in (1, 2):
+        raise AssemblyError("contigs 只能为 1 或 2", "bad_contig_count")
+    if mode is not None and mode not in ("single", "two_contigs"):
+        raise AssemblyError(
+            "mode 只能是 'single' 或 'two_contigs'", "bad_mode"
+        )
+
+    mode_count = 1 if mode in (None, "single") else 2
+    if mode is not None and contigs != mode_count:
+        raise AssemblyError("mode 与 contigs 指定的装配模式不一致", "bad_mode")
+
+    if contigs == 1:
+        return _assemble_single(reads)
+    return assemble_two_contigs(reads)
+
+
+def _assemble_single(reads: list[Read]) -> dict:
+    """求最短单串装配。"""
+
+    n = len(reads)
+    if n == 0:
+        raise AssemblyError("没有读段可供装配")
+
+    variants, overlaps, dp, _best_by_mask = _subset_dp(
+        reads, require_positive_overlap=False
+    )
+    full_mask = (1 << n) - 1
+
+    best = None
+    for last in range(n):
+        for ori in range(2):
+            state = dp.get((full_mask, last, ori))
+            if state is not None and (best is None or state < best):
+                best = state
+    assert best is not None
+    length, assembly, path = best
+    layout = _build_layout(reads, variants, overlaps, path)
+    orientation_by_id = {rid: sign for rid, sign in path}
 
     return {
         "assembly": assembly,
@@ -231,4 +332,78 @@ def assemble(reads: list[Read]) -> dict:
         "orientations": {
             r.id: orientation_by_id[r.id] for r in reads
         },
+    }
+
+
+def assemble_two_contigs(
+    reads: list[Read],
+) -> dict | Literal["NO_TWO_CONTIGS"]:
+    """将读段恰好分入两条非空 contig，求长度之和最短的方案。
+
+    成功时只返回各 contig 的长度、局部坐标和方向路径，不返回拼接片段；
+    不存在满足正重叠约束的二分时返回 :data:`NO_TWO_CONTIGS`。
+    """
+
+    n = len(reads)
+    if n < 2:
+        raise AssemblyError("恰好两条 contig 至少需要两条读段", "bad_read_count")
+
+    variants, overlaps, _dp, best_by_mask = _subset_dp(
+        reads, require_positive_overlap=True
+    )
+    full_mask = (1 << n) - 1
+
+    best_key: tuple[
+        int, tuple[tuple[str, tuple[tuple[str, str], ...]], ...]
+    ] | None = None
+    best_descriptors: tuple[
+        tuple[str, tuple[tuple[str, str], ...], int, list[dict]],
+        tuple[str, tuple[tuple[str, str], ...], int, list[dict]],
+    ] | None = None
+
+    # 枚举所有非空真子集；A/B 互换会在下方按 (装配串, 路径) 归一化排序。
+    for mask in range(1, full_mask):
+        state_a = best_by_mask.get(mask)
+        state_b = best_by_mask.get(full_mask ^ mask)
+        if state_a is None or state_b is None:
+            continue
+
+        descriptors = []
+        for length, assembly, path in (state_a, state_b):
+            descriptors.append(
+                (
+                    assembly,
+                    path,
+                    length,
+                    _build_layout(reads, variants, overlaps, path),
+                )
+            )
+        descriptors.sort(key=lambda item: (item[0], item[1]))
+
+        total_length = descriptors[0][2] + descriptors[1][2]
+        canonical_pair = (
+            (descriptors[0][0], descriptors[0][1]),
+            (descriptors[1][0], descriptors[1][1]),
+        )
+        candidate_key = (total_length, canonical_pair)
+        if best_key is None or candidate_key < best_key:
+            best_key = candidate_key
+            best_descriptors = (descriptors[0], descriptors[1])
+
+    if best_descriptors is None or best_key is None:
+        return NO_TWO_CONTIGS
+
+    return {
+        "total_length": best_key[0],
+        "contigs": [
+            {
+                "length": length,
+                "path": [
+                    {"id": rid, "orientation": sign}
+                    for rid, sign in path
+                ],
+                "layout": layout,
+            }
+            for _assembly, path, length, layout in best_descriptors
+        ],
     }
