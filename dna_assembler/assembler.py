@@ -7,6 +7,8 @@
 * 平局裁决：先取装配串字典序最小；装配串仍相同（如回文读段）时，再按
   ``[(id, 方向), ...]`` 路径字典序最小。
 * 方向标记：``"+"`` 正向，``"-"`` 反向互补。
+* 二 contig 模式要求每个非空 contig 内部相邻读段均有正长度精确重叠；
+  两条 contig 之间不允许用零重叠伪装成连接点。
 
 算法：带子集的动态规划（Held-Karp 式）。10 条读段时
 ``10 * 2^10 * 2`` 个状态、每状态至多 20 条转移，完全枚举等价于穷举
@@ -28,6 +30,9 @@ class AssemblyError(ValueError):
         super().__init__(message)
         self.message = message
         self.code = code
+
+
+NO_TWO_CONTIGS = "NO_TWO_CONTIGS"
 
 
 @dataclass(frozen=True)
@@ -115,6 +120,184 @@ def _reject_containment_or_complement(reads: list[Read]) -> None:
                     f"读段 {reads[i].id!r} 与 {reads[j].id!r} 在某个方向上完整包含",
                     "contained_read",
                 )
+
+
+def _build_overlap_maps(
+    n: int, variants: list[tuple[str, str]]
+) -> tuple[
+    dict[tuple[int, int, int, int], int],
+    dict[tuple[int, int, int, int], str],
+]:
+    """预计算所有定向读段对的最大重叠及追加片段。"""
+
+    ov: dict[tuple[int, int, int, int], int] = {}
+    tail: dict[tuple[int, int, int, int], str] = {}
+    for i in range(n):
+        for oi in range(2):
+            left = variants[i][oi]
+            for j in range(n):
+                if i == j:
+                    continue
+                for oj in range(2):
+                    nxt_seq = variants[j][oj]
+                    size = max_overlap(left, nxt_seq)
+                    edge = (i, oi, j, oj)
+                    ov[edge] = size
+                    tail[edge] = nxt_seq[size:]
+    return ov, tail
+
+
+def _layout_for_path(
+    reads: list[Read],
+    variants: list[tuple[str, str]],
+    ov: dict[tuple[int, int, int, int], int],
+    path: tuple[tuple[str, str], ...],
+) -> list[dict]:
+    """重放一条 contig 内部的 0 基半开局部坐标。"""
+
+    index_by_id = {r.id: idx for idx, r in enumerate(reads)}
+    layout: list[dict] = []
+    cursor = 0
+    prev_idx: int | None = None
+    prev_ori: int | None = None
+    for rid, sign in path:
+        idx = index_by_id[rid]
+        ori = 0 if sign == "+" else 1
+        if prev_idx is None:
+            start = 0
+        else:
+            start = cursor - ov[(prev_idx, prev_ori, idx, ori)]
+        end = start + len(variants[idx][ori])
+        cursor = end
+        layout.append(
+            {
+                "id": rid,
+                "orientation": sign,
+                "start": start,
+                "end": end,
+            }
+        )
+        prev_idx, prev_ori = idx, ori
+    return layout
+
+
+def _best_positive_contigs(
+    reads: list[Read],
+    variants: list[tuple[str, str]],
+    ov: dict[tuple[int, int, int, int], int],
+    tail: dict[tuple[int, int, int, int], str],
+) -> dict[int, tuple[int, str, tuple[tuple[str, str], ...]]]:
+    """求每个非空子集在“所有相邻重叠均大于 0”约束下的最优 contig。"""
+
+    n = len(reads)
+    # 状态值按 (长度, 装配串, 路径) 比较；二 contig 模式的正重叠转移只会追加
+    # 非空片段，因此同一 DP 状态保留该三元组最小值足以支持全局裁决。
+    State = tuple[int, str, tuple[tuple[str, str], ...]]
+    dp: dict[tuple[int, int, int], State] = {}
+    for i in range(n):
+        for ori in range(2):
+            dp[(1 << i, i, ori)] = (
+                len(variants[i][ori]),
+                variants[i][ori],
+                ((reads[i].id, "+" if ori == 0 else "-"),),
+            )
+
+    for mask in range(1 << n):
+        for last in range(n):
+            for ori in range(2):
+                state = dp.get((mask, last, ori))
+                if state is None:
+                    continue
+                length, text, path = state
+                for nxt in range(n):
+                    if mask & (1 << nxt):
+                        continue
+                    for nori in range(2):
+                        edge = (last, ori, nxt, nori)
+                        if ov[edge] == 0:
+                            continue
+                        nxt_seq = variants[nxt][nori]
+                        candidate: State = (
+                            length + len(nxt_seq) - ov[edge],
+                            text + tail[edge],
+                            path
+                            + ((reads[nxt].id, "+" if nori == 0 else "-"),),
+                        )
+                        key = (mask | (1 << nxt), nxt, nori)
+                        current = dp.get(key)
+                        if current is None or candidate < current:
+                            dp[key] = candidate
+
+    best: dict[int, State] = {}
+    for (mask, _last, _ori), state in dp.items():
+        current = best.get(mask)
+        if current is None or state < current:
+            best[mask] = state
+    return best
+
+
+def assemble_two_contigs(reads: list[Read]) -> dict | str:
+    """求恰有两条非空 contig 的最短全局分配、方向与次序。
+
+    与单串模式不同，两个子集之间不连接；每条 contig 内部的每个相邻读段必须
+    有至少一个碱基的精确重叠。返回值不含 contig 拼接片段，只包含局部坐标、
+    方向路径和总长度。无法形成两个非空 contig 时返回 ``NO_TWO_CONTIGS``。
+    """
+
+    n = len(reads)
+    if n < 2:
+        return NO_TWO_CONTIGS
+
+    variants = [(r.seq, reverse_complement(r.seq)) for r in reads]
+    ov, tail = _build_overlap_maps(n, variants)
+    best_by_mask = _best_positive_contigs(reads, variants, ov, tail)
+
+    full_mask = (1 << n) - 1
+    best_total: int | None = None
+    best_key: tuple | None = None
+    best_states: tuple | None = None
+
+    # 固定编号 0 所在的子集为 A，可消除 A/B 互换导致的重复；最终仍按
+    # (装配串, 路径) 对两条 contig 规范化，不依赖输入上传次序。
+    for mask_a in range(1, full_mask):
+        if not (mask_a & 1):
+            continue
+        mask_b = full_mask ^ mask_a
+        state_a = best_by_mask.get(mask_a)
+        state_b = best_by_mask.get(mask_b)
+        if state_a is None or state_b is None:
+            continue
+
+        total = state_a[0] + state_b[0]
+        canonical_states = tuple(
+            sorted((state_a, state_b), key=lambda state: (state[1], state[2]))
+        )
+        tie_key = tuple((state[1], state[2]) for state in canonical_states)
+        if (
+            best_total is None
+            or total < best_total
+            or (total == best_total and tie_key < best_key)
+        ):
+            best_total = total
+            best_key = tie_key
+            best_states = canonical_states
+
+    if best_total is None or best_states is None:
+        return NO_TWO_CONTIGS
+
+    contigs = []
+    for length, _assembly, path in best_states:
+        contigs.append(
+            {
+                "length": length,
+                "path": [
+                    {"id": rid, "orientation": sign} for rid, sign in path
+                ],
+                "layout": _layout_for_path(reads, variants, ov, path),
+            }
+        )
+
+    return {"length": best_total, "contigs": contigs}
 
 
 def assemble(reads: list[Read]) -> dict:
