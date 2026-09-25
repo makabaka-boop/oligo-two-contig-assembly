@@ -1,0 +1,7 @@
+{
+  "reads": [
+    {"id": "r1", "seq": "GATTACA"},
+    {"id": "r2", "seq": "TGTATGA"},
+    {"id": "r3", "seq": "TAGACAT"}
+  ]
+}

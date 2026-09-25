@@ -1,0 +1,13 @@
+services:
+  assembler:
+    build: .
+    image: dna-assembler:latest
+    container_name: dna-assembler
+    # 服务从 stdin 读取 JSON 请求并把结果 JSON 写到 stdout；
+    # Compose 的 assembler 服务通过
+    #   docker compose run --rm assembler < request.json
+    # 与之交互。
+    stdin_open: true
+    tty: false
+    entrypoint: ["python", "-m", "dna_assembler"]
+    restart: "no"
